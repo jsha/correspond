@@ -15,7 +15,7 @@ import (
 
 func main() {
 	if len(os.Args) != 3 {
-		log.Fatal("Usage: corr precert.pem final.pem")
+		log.Fatalf("Usage: %s precert.pem final.pem", os.Args[0])
 	}
 	err := main2(os.Args[1], os.Args[2])
 	if err != nil {
@@ -24,14 +24,30 @@ func main() {
 }
 
 func main2(precertFile, finalFile string) error {
-	preTBS, err := tbsCertificateFromPEMFile(precertFile)
+	precertDER, err := derFromPEMFile(precertFile)
 	if err != nil {
 		return fmt.Errorf("parsing precert: %w", err)
 	}
 
-	finalTBS, err := tbsCertificateFromPEMFile(finalFile)
+	finalDER, err := derFromPEMFile(finalFile)
+	if err != nil {
+		return fmt.Errorf("parsing final cert: %w", err)
+	}
+
+	return Correspond(precertDER, finalDER)
+}
+
+// Correspond returns nil if the two certificates are a valid precertificate/final certificate pair.
+// Order of the arguments matters: the precertificate is first and the final certificate is second.
+func Correspond(precertDER, finalDER []byte) error {
+	preTBS, err := tbsDERFromCertDER(precertDER)
 	if err != nil {
 		return fmt.Errorf("parsing precert: %w", err)
+	}
+
+	finalTBS, err := tbsDERFromCertDER(finalDER)
+	if err != nil {
+		return fmt.Errorf("parsing final cert: %w", err)
 	}
 
 	// The first 7 fields of TBSCertificate must be byte-for-byte identical.
@@ -77,18 +93,25 @@ func main2(precertFile, finalFile string) error {
 
 	var foundPoison, foundSCTList bool
 	for !precertExtensionBytes.Empty() {
+		if finalCertExtensionBytes.Empty() {
+			return fmt.Errorf("excess extensions in precert")
+		}
+
 		var precertExtn cryptobyte.String
 		if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
 			return fmt.Errorf("failed to parse precert extension")
 		}
 
 		// When we hit the poison extension, skip past it and parse the next one for comparison.
+		precertEOF := false
 		if isPoisonExtension(precertExtn) {
 			if foundPoison {
 				return fmt.Errorf("duplicate poison extension")
 			}
 			foundPoison = true
-			if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
+			if precertExtensionBytes.Empty() {
+				precertEOF = true
+			} else if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
 				return fmt.Errorf("failed to parse precert extension")
 			}
 		}
@@ -99,14 +122,23 @@ func main2(precertFile, finalFile string) error {
 		}
 
 		// When we hit the SCTList extension, skip past it and parse the next one for comparison.
+		finalCertEOF := false
 		if isSCTLExtension(finalCertExtn) {
 			if foundSCTList {
 				return fmt.Errorf("duplicate SCTList extension")
 			}
 			foundSCTList = true
-			if !finalCertExtensionBytes.ReadASN1(&finalCertExtn, asn1.SEQUENCE) {
-				return fmt.Errorf("failed to parse final cert extension")
+			if finalCertExtensionBytes.Empty() {
+				finalCertEOF = true
+			} else if !finalCertExtensionBytes.ReadASN1(&finalCertExtn, asn1.SEQUENCE) {
+				return fmt.Errorf("failed to parse final cert extension after SCTList")
 			}
+		}
+
+		// When the poison extension and the SCTList extension are both empty, we'll hit the end
+		// of each extensions list in the same iteration and have nothing left to compare.
+		if precertEOF && finalCertEOF {
+			break
 		}
 
 		if !bytes.Equal(precertExtn, finalCertExtn) {
@@ -127,7 +159,11 @@ func main2(precertFile, finalFile string) error {
 }
 
 func isPoisonExtension(extn cryptobyte.String) bool {
-	return bytes.Equal(extn, []byte{0x05, 0x00})
+	var oid encoding_asn1.ObjectIdentifier
+	if !extn.ReadASN1ObjectIdentifier(&oid) {
+		return false
+	}
+	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3})
 }
 
 func isSCTLExtension(extn cryptobyte.String) bool {
@@ -135,7 +171,7 @@ func isSCTLExtension(extn cryptobyte.String) bool {
 	if !extn.ReadASN1ObjectIdentifier(&oid) {
 		return false
 	}
-	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 5})
+	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2})
 }
 
 // given a sequence of bytes representing the `extensions` field of TBSCertificate, parse the field,
@@ -173,21 +209,23 @@ func readIdenticalElement(a, b *cryptobyte.String) error {
 	return nil
 }
 
-func tbsCertificateFromPEMFile(filename string) (cryptobyte.String, error) {
+func derFromPEMFile(filename string) ([]byte, error) {
 	precertPEM, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", filename, err)
 	}
 
 	precertPEMBlock, _ := pem.Decode(precertPEM)
-	if err != nil {
-		return nil, fmt.Errorf("decoding %s: %w", filename, err)
+	if precertPEMBlock == nil {
+		return nil, fmt.Errorf("error PEM decoding %s", filename)
 	}
 
-	precertDER := precertPEMBlock.Bytes
+	return precertPEMBlock.Bytes, nil
+}
 
+func tbsDERFromCertDER(certDER []byte) (cryptobyte.String, error) {
 	var inner cryptobyte.String
-	input := cryptobyte.String(precertDER)
+	input := cryptobyte.String(certDER)
 
 	if !input.ReadASN1(&inner, asn1.SEQUENCE) {
 		return nil, fmt.Errorf("failed to read outer sequence")
