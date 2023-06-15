@@ -80,6 +80,8 @@ func Correspond(precertDER, finalDER []byte) error {
 	//    not present in the final certificate.
 	//  - The final certificate should have exactly one SCTList extension not present
 	//    in the precertificate.
+	//  - As a consequence, the byte lengths of the extensions fields will not be the
+	//    same, so we ignore the lengths (so long as they parse)
 	precertExtensionBytes, err := unwrapExtensions(preTBS)
 	if err != nil {
 		return fmt.Errorf("parsing precert extensions: %w", err)
