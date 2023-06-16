@@ -159,6 +159,8 @@ func Correspond(precertDER, finalDER []byte) error {
 	return nil
 }
 
+// isPoisonExtension returns true if the given bytes start with the OID for the
+// CT poison extension.
 func isPoisonExtension(extn cryptobyte.String) bool {
 	var oid encoding_asn1.ObjectIdentifier
 	if !extn.ReadASN1ObjectIdentifier(&oid) {
@@ -167,6 +169,8 @@ func isPoisonExtension(extn cryptobyte.String) bool {
 	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3})
 }
 
+// isSCTLExtension returns true if the given bytes start with the OID for the
+// CT SCTList extension.
 func isSCTLExtension(extn cryptobyte.String) bool {
 	var oid encoding_asn1.ObjectIdentifier
 	if !extn.ReadASN1ObjectIdentifier(&oid) {
@@ -175,8 +179,9 @@ func isSCTLExtension(extn cryptobyte.String) bool {
 	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2})
 }
 
-// given a sequence of bytes representing the `extensions` field of TBSCertificate, parse the field,
-// then parse the SEQUENCE inside it, returning the inner bytes of that SEQUENCE.
+// unwrapExtensions taks a given a sequence of bytes representing the `extensions` field
+// of a TBSCertificate and parses away the outermost two layers, returning the inner bytes
+// of a SEQUENCE, which can then be parsed as a list of extensions.
 func unwrapExtensions(field cryptobyte.String) (cryptobyte.String, error) {
 	var extensions cryptobyte.String
 	if !field.ReadASN1(&extensions, asn1.Tag(3).Constructed().ContextSpecific()) {
@@ -191,7 +196,8 @@ func unwrapExtensions(field cryptobyte.String) (cryptobyte.String, error) {
 	return extensionsInner, nil
 }
 
-// read a single ASN1 element, return error if their tags are different or their contents are different.
+// readIdenticalElement parses a single ASN1 element and returns an error if
+// their tags are different or their contents are different.
 func readIdenticalElement(a, b *cryptobyte.String) error {
 	var aInner, bInner cryptobyte.String
 	var aTag, bTag asn1.Tag
@@ -210,6 +216,7 @@ func readIdenticalElement(a, b *cryptobyte.String) error {
 	return nil
 }
 
+// derFromPEMFile reads a PEM file and returns the DER-encoded bytes.
 func derFromPEMFile(filename string) ([]byte, error) {
 	precertPEM, err := os.ReadFile(filename)
 	if err != nil {
@@ -224,6 +231,8 @@ func derFromPEMFile(filename string) ([]byte, error) {
 	return precertPEMBlock.Bytes, nil
 }
 
+// tbsDERFromCertDER takes a Certficate object encoded as DER, and parses
+// away the outermost two SEQUENCEs to get the TBSCertificate.
 func tbsDERFromCertDER(certDER []byte) (cryptobyte.String, error) {
 	var inner cryptobyte.String
 	input := cryptobyte.String(certDER)
