@@ -92,57 +92,16 @@ func Correspond(precertDER, finalDER []byte) error {
 		return fmt.Errorf("parsing final cert extensions: %w", err)
 	}
 
-	poisonsFound := 0
-	// Predeclare these function variables so they can recurse
-	var finalCertNext, precertNext func() (cryptobyte.String, error)
-	// Read an extension from the precert, skipping (and counting) poison
-	// extensions. Return nil, nil if we've reached the end.
-	precertNext = func() (cryptobyte.String, error) {
-		if precertExtensionBytes.Empty() {
-			return nil, nil
-		}
-
-		var precertExtn cryptobyte.String
-		if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
-			return nil, fmt.Errorf("failed to parse precert extension")
-		}
-
-		if isPoisonExtension(precertExtn) {
-			poisonsFound++
-			return precertNext()
-		}
-
-		return precertExtn, nil
-	}
-
-	sctListsFound := 0
-	// Read an extension from the precert, skipping (and counting) SCTList
-	// extensions. Return nil, nil if we've reached the end.
-	finalCertNext = func() (cryptobyte.String, error) {
-		if finalCertExtensionBytes.Empty() {
-			return nil, nil
-		}
-
-		var finalCertExtn cryptobyte.String
-		if !finalCertExtensionBytes.ReadASN1(&finalCertExtn, asn1.SEQUENCE) {
-			return nil, fmt.Errorf("failed to parse final cert extension")
-		}
-
-		// Skip SCTList extension and try again
-		if isSCTLExtension(finalCertExtn) {
-			sctListsFound++
-			return finalCertNext()
-		}
-		return finalCertExtn, nil
-	}
+	precertParser := extensionParser{bytes: precertExtensionBytes, skippableOID: poisonOID}
+	finalCertParser := extensionParser{bytes: finalCertExtensionBytes, skippableOID: sctListOID}
 
 	for {
-		precertExtn, err := precertNext()
+		precertExtn, err := precertParser.Next()
 		if err != nil {
 			return err
 		}
 
-		finalCertExtn, err := finalCertNext()
+		finalCertExtn, err := finalCertParser.Next()
 		if err != nil {
 			return err
 		}
@@ -156,43 +115,59 @@ func Correspond(precertDER, finalDER []byte) error {
 		}
 	}
 
-	if poisonsFound == 0 {
+	if precertParser.skipped == 0 {
 		return fmt.Errorf("no poison extension found in precert")
 	}
-	if poisonsFound > 1 {
+	if precertParser.skipped > 1 {
 		return fmt.Errorf("multiple poison extensions found in precert")
 	}
-	if sctListsFound == 0 {
+	if finalCertParser.skipped == 0 {
 		return fmt.Errorf("no SCTList extension found in final cert")
 	}
-	if sctListsFound > 1 {
+	if finalCertParser.skipped > 1 {
 		return fmt.Errorf("multiple SCTList extensions found in final cert")
 	}
 	return nil
 }
 
 var poisonOID = []int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}
-
-// isPoisonExtension returns true if the given bytes start with the OID for the
-// CT poison extension.
-func isPoisonExtension(extn cryptobyte.String) bool {
-	var oid encoding_asn1.ObjectIdentifier
-	if !extn.ReadASN1ObjectIdentifier(&oid) {
-		return false
-	}
-	return oid.Equal(poisonOID)
-}
-
 var sctListOID = []int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2}
 
-// isSCTLExtension returns true if the given bytes start with the OID for the
-// CT SCTList extension.
-func isSCTLExtension(extn cryptobyte.String) bool {
-	var oid encoding_asn1.ObjectIdentifier
-	if !extn.ReadASN1ObjectIdentifier(&oid) {
-		return false
+// extensionParser takes a sequence of bytes representing the inner bytes of the
+// `extensions` field. Repeated calls to Next() will return all the extensions
+// except those that match the skippableOID. The skipped extensions will be
+// counted in `skipped`.
+type extensionParser struct {
+	skippableOID encoding_asn1.ObjectIdentifier
+	bytes        cryptobyte.String
+	skipped      int
+}
+
+// Next returns the next extension in the sequence, skipping (and counting)
+// any extension that matches the skippableOID.
+// Returns nil, nil when there are no more extensions.
+func (e *extensionParser) Next() (cryptobyte.String, error) {
+	if e.bytes.Empty() {
+		return nil, nil
 	}
-	return oid.Equal(sctListOID)
+
+	var next cryptobyte.String
+	if !e.bytes.ReadASN1(&next, asn1.SEQUENCE) {
+		return nil, fmt.Errorf("failed to parse extension")
+	}
+
+	var oid encoding_asn1.ObjectIdentifier
+	nextCopy := next
+	if !nextCopy.ReadASN1ObjectIdentifier(&oid) {
+		return nil, fmt.Errorf("failed to parse extension OID")
+	}
+
+	if oid.Equal(e.skippableOID) {
+		e.skipped++
+		return e.Next()
+	}
+
+	return next, nil
 }
 
 // unwrapExtensions taks a given a sequence of bytes representing the `extensions` field
