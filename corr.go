@@ -95,7 +95,7 @@ func Correspond(precertDER, finalDER []byte) error {
 	precertParser := extensionParser{bytes: precertExtensionBytes, skippableOID: poisonOID}
 	finalCertParser := extensionParser{bytes: finalCertExtensionBytes, skippableOID: sctListOID}
 
-	for {
+	for i := 0; ; i++ {
 		precertExtn, err := precertParser.Next()
 		if err != nil {
 			return err
@@ -107,7 +107,8 @@ func Correspond(precertDER, finalDER []byte) error {
 		}
 
 		if !bytes.Equal(precertExtn, finalCertExtn) {
-			return fmt.Errorf("extensions differed: '%x' (precert) vs '%x' (final)", precertExtn, finalCertExtn)
+			return fmt.Errorf("extensions differed at position %d: '%x' (precert) vs '%x' (final)",
+				i+precertParser.skipped, precertExtn, finalCertExtn)
 		}
 
 		if precertExtn == nil && finalCertExtn == nil {
