@@ -1,8 +1,15 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCorrespondGood(t *testing.T) {
@@ -59,4 +66,197 @@ func readPair(a, b string) ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 	return aDER, bDER, nil
+}
+
+func TestMismatches(t *testing.T) {
+	issuerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A separate issuer key, used for signing the final certificate, but
+	// using the same simulated issuer certificate.
+	untrustedIssuerKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	subscriberKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// By reading the crypto/x509 code, we know that Subject is the only field
+	// of the issuer certificate that we need to care about for the purposes
+	// of signing below.
+	issuer := x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "Some Issuer",
+		},
+	}
+
+	precertTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(3141592653589793238),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		DNSNames:     []string{"example.com"},
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:    poisonOID,
+				Value: []byte{0x5, 0x0},
+			},
+		},
+	}
+
+	precertDER, err := x509.CreateCertificate(rand.Reader, &precertTemplate, &issuer, &subscriberKey.PublicKey, issuerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sign a final certificate with the untrustedIssuerKey, first applying the
+	// given modify function to the default template. Return the DER encoded bytes.
+	makeFinalCert := func(modify func(c *x509.Certificate)) []byte {
+		t.Helper()
+		finalCertTemplate := &x509.Certificate{
+			SerialNumber: big.NewInt(3141592653589793238),
+			NotBefore:    time.Now(),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			DNSNames:     []string{"example.com"},
+			ExtraExtensions: []pkix.Extension{
+				{
+					Id:    sctListOID,
+					Value: nil,
+				},
+			},
+		}
+
+		modify(finalCertTemplate)
+
+		finalCertDER, err := x509.CreateCertificate(rand.Reader, finalCertTemplate,
+			&issuer, &subscriberKey.PublicKey, untrustedIssuerKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return finalCertDER
+	}
+
+	// Expect success with a matching precert and final cert
+	finalCertDER := makeFinalCert(func(c *x509.Certificate) {})
+	err = Correspond(precertDER, finalCertDER)
+	if err != nil {
+		t.Errorf("expected precert and final cert to correspond, got: %s", err)
+	}
+
+	precertTemplate2 := x509.Certificate{
+		SerialNumber: big.NewInt(3141592653589793238),
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		DNSNames:     []string{"example.com"},
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:    poisonOID,
+				Value: []byte{0x5, 0x0},
+			},
+			// Arbitrary extension to make poisonOID not be the last extension
+			{
+				Id:    []int{1, 2, 3, 4},
+				Value: []byte{0x5, 0x0},
+			},
+		},
+	}
+
+	precertDER2, err := x509.CreateCertificate(rand.Reader, &precertTemplate2, &issuer, &subscriberKey.PublicKey, issuerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.ExtraExtensions = []pkix.Extension{
+			{
+				Id:    []int{1, 2, 3, 4},
+				Value: []byte{0x5, 0x0},
+			},
+			{
+				Id:    sctListOID,
+				Value: nil,
+			},
+		}
+	})
+	err = Correspond(precertDER2, finalCertDER)
+	if err != nil {
+		t.Errorf("expected precert and final cert to correspond with differently positioned extensions, got: %s", err)
+	}
+
+	// Expect failure with a mismatched Issuer
+	issuer = x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "Some Other Issuer",
+		},
+	}
+
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {})
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched issuer, got nil error")
+	}
+
+	// Restore original issuer
+	issuer = x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "Some Issuer",
+		},
+	}
+
+	// Expect failure with a mismatched Serial
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.SerialNumber = big.NewInt(2718281828459045)
+	})
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched serial, got nil error")
+	}
+
+	// Expect failure with mismatched names
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.DNSNames = []string{"example.com", "www.example.com"}
+	})
+
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched names, got nil error")
+	}
+
+	// Expect failure with mismatched NotBefore
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.NotBefore = time.Now().Add(24 * time.Hour)
+	})
+
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched NotBefore, got nil error")
+	}
+
+	// Expect failure with mismatched NotAfter
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.NotAfter = time.Now().Add(48 * time.Hour)
+	})
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched NotAfter, got nil error")
+	}
+
+	// Expect failure for mismatches extensions
+	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
+		c.ExtraExtensions = append(c.ExtraExtensions, pkix.Extension{
+			Critical: true,
+			Id:       []int{1, 2, 3},
+			Value:    []byte("hello"),
+		})
+	})
+
+	err = Correspond(precertDER, finalCertDER)
+	if err == nil {
+		t.Errorf("expected error for mismatched extensions, got nil error")
+	}
 }

@@ -75,7 +75,7 @@ func Correspond(precertDER, finalDER []byte) error {
 		}
 	}
 
-	// The extensions should be mostly the same, with these two exceptions:
+	// The extensions should be mostly the same, with these exceptions:
 	//  - The precertificate should have exactly one precertificate poison extension
 	//    not present in the final certificate.
 	//  - The final certificate should have exactly one SCTList extension not present
@@ -92,72 +92,86 @@ func Correspond(precertDER, finalDER []byte) error {
 		return fmt.Errorf("parsing final cert extensions: %w", err)
 	}
 
-	var foundPoison, foundSCTList bool
-	for !precertExtensionBytes.Empty() {
-		if finalCertExtensionBytes.Empty() {
-			return fmt.Errorf("excess extensions in precert")
+	poisonsFound := 0
+	// Predeclare these function variables so they can recurse
+	var finalCertNext, precertNext func() (cryptobyte.String, error)
+	// Read an extension from the precert, skipping (and counting) poison
+	// extensions. Return nil, nil if we've reached the end.
+	precertNext = func() (cryptobyte.String, error) {
+		if precertExtensionBytes.Empty() {
+			return nil, nil
 		}
 
 		var precertExtn cryptobyte.String
 		if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
-			return fmt.Errorf("failed to parse precert extension")
+			return nil, fmt.Errorf("failed to parse precert extension")
 		}
 
-		// When we hit the poison extension, skip past it and parse the next one for comparison.
-		precertEOF := false
 		if isPoisonExtension(precertExtn) {
-			if foundPoison {
-				return fmt.Errorf("duplicate poison extension")
-			}
-			foundPoison = true
-			if precertExtensionBytes.Empty() {
-				precertEOF = true
-			} else if !precertExtensionBytes.ReadASN1(&precertExtn, asn1.SEQUENCE) {
-				return fmt.Errorf("failed to parse precert extension")
-			}
+			poisonsFound++
+			return precertNext()
+		}
+
+		return precertExtn, nil
+	}
+
+	sctListsFound := 0
+	// Read an extension from the precert, skipping (and counting) SCTList
+	// extensions. Return nil, nil if we've reached the end.
+	finalCertNext = func() (cryptobyte.String, error) {
+		if finalCertExtensionBytes.Empty() {
+			return nil, nil
 		}
 
 		var finalCertExtn cryptobyte.String
 		if !finalCertExtensionBytes.ReadASN1(&finalCertExtn, asn1.SEQUENCE) {
-			return fmt.Errorf("failed to parse final cert extension")
+			return nil, fmt.Errorf("failed to parse final cert extension")
 		}
 
-		// When we hit the SCTList extension, skip past it and parse the next one for comparison.
-		finalCertEOF := false
+		// Skip SCTList extension and try again
 		if isSCTLExtension(finalCertExtn) {
-			if foundSCTList {
-				return fmt.Errorf("duplicate SCTList extension")
-			}
-			foundSCTList = true
-			if finalCertExtensionBytes.Empty() {
-				finalCertEOF = true
-			} else if !finalCertExtensionBytes.ReadASN1(&finalCertExtn, asn1.SEQUENCE) {
-				return fmt.Errorf("failed to parse final cert extension after SCTList")
-			}
+			sctListsFound++
+			return finalCertNext()
+		}
+		return finalCertExtn, nil
+	}
+
+	for {
+		precertExtn, err := precertNext()
+		if err != nil {
+			return err
 		}
 
-		// When the poison extension and the SCTList extension are both empty, we'll hit the end
-		// of each extensions list in the same iteration and have nothing left to compare.
-		if precertEOF && finalCertEOF {
-			break
+		finalCertExtn, err := finalCertNext()
+		if err != nil {
+			return err
 		}
 
 		if !bytes.Equal(precertExtn, finalCertExtn) {
-			return fmt.Errorf("extensions differed: %x vs %x", precertExtn, finalCertExtn)
+			return fmt.Errorf("extensions differed: '%x' vs '%x'", precertExtn, finalCertExtn)
+		}
+
+		if precertExtn == nil && finalCertExtn == nil {
+			break
 		}
 	}
 
-	if !finalCertExtensionBytes.Empty() {
-		return fmt.Errorf("excess extensions in final cert")
-	}
-	if !foundPoison {
+	if poisonsFound == 0 {
 		return fmt.Errorf("no poison extension found in precert")
 	}
-	if !foundSCTList {
+	if poisonsFound > 1 {
+		return fmt.Errorf("multiple poison extensions found in precert")
+	}
+	if sctListsFound == 0 {
 		return fmt.Errorf("no SCTList extension found in final cert")
+	}
+	if sctListsFound > 1 {
+		return fmt.Errorf("multiple SCTList extensions found in final cert")
 	}
 	return nil
 }
+
+var poisonOID = []int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3}
 
 // isPoisonExtension returns true if the given bytes start with the OID for the
 // CT poison extension.
@@ -166,8 +180,10 @@ func isPoisonExtension(extn cryptobyte.String) bool {
 	if !extn.ReadASN1ObjectIdentifier(&oid) {
 		return false
 	}
-	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 3})
+	return oid.Equal(poisonOID)
 }
+
+var sctListOID = []int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2}
 
 // isSCTLExtension returns true if the given bytes start with the OID for the
 // CT SCTList extension.
@@ -176,7 +192,7 @@ func isSCTLExtension(extn cryptobyte.String) bool {
 	if !extn.ReadASN1ObjectIdentifier(&oid) {
 		return false
 	}
-	return oid.Equal([]int{1, 3, 6, 1, 4, 1, 11129, 2, 4, 2})
+	return oid.Equal(sctListOID)
 }
 
 // unwrapExtensions taks a given a sequence of bytes representing the `extensions` field
