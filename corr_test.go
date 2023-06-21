@@ -148,6 +148,8 @@ func TestMismatches(t *testing.T) {
 		t.Errorf("expected precert and final cert to correspond, got: %s", err)
 	}
 
+	// Set up a precert / final cert pair where the SCTList and poison extensions are
+	// not in the same position
 	precertTemplate2 := x509.Certificate{
 		SerialNumber: big.NewInt(3141592653589793238),
 		NotBefore:    time.Now(),
@@ -246,7 +248,7 @@ func TestMismatches(t *testing.T) {
 		t.Errorf("expected error for mismatched NotAfter, got nil error")
 	}
 
-	// Expect failure for mismatches extensions
+	// Expect failure for mismatched extensions
 	finalCertDER = makeFinalCert(func(c *x509.Certificate) {
 		c.ExtraExtensions = append(c.ExtraExtensions, pkix.Extension{
 			Critical: true,
@@ -258,5 +260,9 @@ func TestMismatches(t *testing.T) {
 	err = Correspond(precertDER, finalCertDER)
 	if err == nil {
 		t.Errorf("expected error for mismatched extensions, got nil error")
+	}
+	expectedError := "extensions differed: '' (precert) vs '06022a030101ff040568656c6c6f' (final)"
+	if err.Error() != expectedError {
+		t.Errorf("expected error %q, got %q", expectedError, err)
 	}
 }

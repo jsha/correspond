@@ -107,7 +107,7 @@ func Correspond(precertDER, finalDER []byte) error {
 		}
 
 		if !bytes.Equal(precertExtn, finalCertExtn) {
-			return fmt.Errorf("extensions differed: '%x' vs '%x'", precertExtn, finalCertExtn)
+			return fmt.Errorf("extensions differed: '%x' (precert) vs '%x' (final)", precertExtn, finalCertExtn)
 		}
 
 		if precertExtn == nil && finalCertExtn == nil {
