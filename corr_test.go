@@ -12,6 +12,28 @@ import (
 	"time"
 )
 
+func TestConsistentGood(t *testing.T) {
+	finalDER, err := derFromPEMFile("testdata/good/final.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuerDER, err := derFromPEMFile("testdata/good/lets-encrypt-r3.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	issuer, err := x509.ParseCertificate(issuerDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = Consistent(finalDER, issuer)
+	if err != nil {
+		t.Errorf("expected testdata/good/final.pem to be consistent, got %s", err)
+	}
+}
+
 func TestCorrespondGood(t *testing.T) {
 	pre, final, err := readPair("testdata/good/precert.pem", "testdata/good/final.pem")
 	if err != nil {
