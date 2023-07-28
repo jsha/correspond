@@ -53,11 +53,16 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 		return fmt.Errorf("parsing final cert: %w", err)
 	}
 
-	// In urTBS we will construct a TBSCertificate that has all of the fields
-	// of the finalTBS, with the exception that the extensions omit the SCTList.
+	// In urTBS* we will construct the inner portion of a TBSCertificate that
+	// has all of the fields of the finalTBS, with the exception that the
+	// extensions omit the SCTList.
+	// Once we're done, we'll have to wrap this in an outer SEQUENCE that
+	// reflects the different size of the urTBS compared to the finalTBS.
+	//
+	// *ur-: primeval, original
 	urTBS := cryptobyte.NewBuilder(nil)
 
-	// Read the first 7 fields and copy them into the jrTBS.
+	// Read the first 7 fields and copy them into the urTBS.
 	//
 	// The next 2 fields (issuerUniqueID and subjectUniqueID) are forbidden
 	// by the Baseline Requirements so we assume they are not present (if they
@@ -94,6 +99,8 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 	}
 
 	var scts []signedCertificateTimestamp
+	// The urExtensions are a copy of the original extensions with any SCTList
+	// extensions removed.
 	urExtensions := cryptobyte.NewBuilder(nil)
 	for i := 0; !finalCertExtensionBytes.Empty(); i++ {
 		var extn cryptobyte.String
@@ -108,24 +115,26 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 		}
 
 		if oid.Equal(sctListOID) {
-			// The SCTList extension should not be critical. Since the critical
-			// bit of an Extension is DEFAULT FALSE, we expect not to see it; but
-			// we check just in case.
+			// Since the critical bit of an Extension is DEFAULT FALSE, and
+			// we expect the SCTList to be non-critical, we expect not to see
+			// it encoded at all. We check just in case.
 			if extnCopy.PeekASN1Tag(asn1.BOOLEAN) {
-				return fmt.Errorf("SCTList extension should not be critical")
+				return fmt.Errorf("extension SCTList should not be critical")
 			}
 			var val cryptobyte.String
 			if !extnCopy.ReadASN1(&val, asn1.OCTET_STRING) {
-				return errors.New("malformed extension value field")
+				return errors.New("malformed extension value for SCTList")
 			}
 			var sctList cryptobyte.String
 			if !val.ReadASN1(&sctList, asn1.OCTET_STRING) {
-				return errors.New("malformed extension value (inner)")
+				return errors.New("malformed extension value for SCTList (inner)")
 			}
 			scts, err = parseSCTList(sctList)
 			if err != nil {
 				return fmt.Errorf("parsing SCTList: %w", err)
 			}
+
+			// Don't copy this extension into urExtensions
 			continue
 		}
 
@@ -139,6 +148,8 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 		return fmt.Errorf("serializing urExtensions: %w", err)
 	}
 
+	// Now that we've calculated the urExtensions (and know their byte length),
+	// we can append them to the urTBS.
 	urTBS.AddASN1(asn1.Tag(3).Constructed().ContextSpecific(), func(child *cryptobyte.Builder) {
 		child.AddASN1(asn1.SEQUENCE, func(child *cryptobyte.Builder) {
 			child.AddBytes(urExtensionsBytes)
@@ -150,6 +161,7 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 		return fmt.Errorf("serializing urTBS: %w", err)
 	}
 
+	// Wrap the urTBS in an outer SEQUENCE now that we know its byte length.
 	urTBSOuter := cryptobyte.NewBuilder(nil)
 	urTBSOuter.AddASN1(asn1.SEQUENCE, func(child *cryptobyte.Builder) {
 		child.AddASN1(asn1.SEQUENCE, func(child *cryptobyte.Builder) {
@@ -162,6 +174,9 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 		return fmt.Errorf("serializing urTBSOuter: %w", err)
 	}
 
+	// Phew! Now that we have the fully encoded TBSCertificate as it
+	// theoretically exists without the SCTList, we can verify that the SCTs
+	// (which we extracted earlier) match it.
 	for i, sct := range scts {
 		err := sct.Verify(urTBSOuterBytes, issuer)
 		if err != nil {
@@ -172,18 +187,29 @@ func Consistent(finalDER []byte, issuer *x509.Certificate) error {
 	return nil
 }
 
+// signedCertificateTimestamp represents the parsed fields of a
+// SignedCertificateTimestamp. Note that the fields of the digitally-signed
+// struct are not present here because they are not encoded in the SCT.
+// Some are copied from the outer SignedCertificateTimestamp struct (sct_version,
+// id, timestamp, and extensions). The others are deduced from the
+// protocol and the context in which we're verifying (signature_type, entry_type,
+// signed_entry)
 type signedCertificateTimestamp struct {
-	Version      uint8
-	LogID        [32]byte
-	Timestamp    uint64
-	CTExtensions []byte
-	// For implementation simplicity this is always a sha256/ecdsa signature
-	Signature []byte
+	sct_version uint8
+	id          [32]byte // The ID of the log that issued this SCT
+	timestamp   uint64
+	extensions  []byte
+	// For implementation simplicity we assume this is always sha256/ecdsa
+	signature []byte
 }
 
+// Verify checks that the SCT corresponds to the given urTBS and issuer.
+// It assumes the urTBS is a correctly encoded TBSCertificate derived from a
+// final certificate by removing the SCTList extension and re-encoding.
+// It also assumes that `issuer` is the issuer of the final certificate.
 func (sct signedCertificateTimestamp) Verify(urTBS []byte, issuer *x509.Certificate) error {
 	var signedData bytes.Buffer
-	binary.Write(&signedData, binary.BigEndian, sct.Version)
+	binary.Write(&signedData, binary.BigEndian, sct.sct_version)
 	var certificateTimestampSignatureType uint8 = 0
 	binary.Write(&signedData, binary.BigEndian, certificateTimestampSignatureType)
 	// https://datatracker.ietf.org/doc/html/rfc6962#page-11
@@ -203,34 +229,44 @@ func (sct signedCertificateTimestamp) Verify(urTBS []byte, issuer *x509.Certific
 	io.Copy(&signedData, bytes.NewReader(issuerKeyHash[:]))
 	io.Copy(&signedData, bytes.NewReader(urTBS))
 
-	if len(sct.CTExtensions) > math.MaxUint16 {
+	if len(sct.extensions) > math.MaxUint16 {
 		return errors.New("CTExtensions too long")
 	}
-	ctExtensionsLen := uint16(len(sct.CTExtensions))
+	ctExtensionsLen := uint16(len(sct.extensions))
 	binary.Write(&signedData, binary.BigEndian, ctExtensionsLen)
-	io.Copy(&signedData, bytes.NewReader(sct.CTExtensions))
+	io.Copy(&signedData, bytes.NewReader(sct.extensions))
 
 	// Assumption: the SCT is always sha256/ecdsa
 	digitallySignedHash := sha256.Sum256(signedData.Bytes())
 
-	var r, s big.Int
-	var signature cryptobyte.String = sct.Signature
-	var signatureInner cryptobyte.String
-	if !signature.ReadASN1(&signatureInner, asn1.SEQUENCE) {
-		return errors.New("failed to parse signature SEQUENCE")
+	r, s, err := parseECDSASignature(sct.signature)
+	if err != nil {
+		return err
 	}
-	if !signatureInner.ReadASN1Integer(&r) {
-		return errors.New("failed to lparse r")
-	}
-	if !signatureInner.ReadASN1Integer(&s) {
-		return errors.New("failed to parse s")
-	}
-	logPubKey, err := findLogKey(sct.LogID)
+	logPubKey, err := findLogKey(sct.id)
 	if err != nil {
 		return err
 	}
 	ecdsa.Verify(logPubKey, digitallySignedHash[:], &r, &s)
 	return nil
+}
+
+// parseECDSASignature parses an ECDSA signature in ASN.1 format, as specified
+// in https://datatracker.ietf.org/doc/html/rfc4492. Returns r and s, or error.
+func parseECDSASignature(input []byte) (*big.Int, *big.Int, error) {
+	var r, s big.Int
+	var signature cryptobyte.String = input
+	var signatureInner cryptobyte.String
+	if !signature.ReadASN1(&signatureInner, asn1.SEQUENCE) {
+		return nil, nil, errors.New("failed to parse signature SEQUENCE")
+	}
+	if !signatureInner.ReadASN1Integer(&r) {
+		return nil, nil, errors.New("failed to lparse r")
+	}
+	if !signatureInner.ReadASN1Integer(&s) {
+		return nil, nil, errors.New("failed to parse s")
+	}
+	return &r, &s
 }
 
 // findLogKey looks up a CT log by its logID and returns the public key.
@@ -314,9 +350,9 @@ func findLogKey(logID [32]byte) (logPublicKey *ecdsa.PublicKey, err error) {
 func parseSCTList(extn cryptobyte.String) ([]signedCertificateTimestamp, error) {
 	reader := bytes.NewReader(extn)
 
-	// First comes the sctListLen, in bytes, of the SignedCertificateTimestampList.
-	// The number of bytes encoding the sctListLen field is however many bytes it
-	// would take to encode the max sctListLen. In this case that's 2 bytes, to encode
+	// First comes the length, in bytes, of the SignedCertificateTimestampList.
+	// The number of bytes encoding the length is however many bytes it
+	// would take to encode the max length. In this case that's 2 bytes, to encode
 	// a sctListLen of 2^16-1.
 	var sctListLen uint16
 	err := binary.Read(reader, binary.BigEndian, &sctListLen)
@@ -324,33 +360,36 @@ func parseSCTList(extn cryptobyte.String) ([]signedCertificateTimestamp, error) 
 		return nil, fmt.Errorf("reading SCTList length: %w", err)
 	}
 
+	// Make sure there aren't any ignored bytes at the end of the extension.
 	if sctListLen != uint16(len(extn))-2 {
 		return nil, fmt.Errorf("SCTList length %d does not match extension length %d", sctListLen, len(extn))
 	}
 
 	var scts []signedCertificateTimestamp
 	for reader.Len() > 0 {
+		// This is the length of a single SCT, in bytes. Max is 2^16-1.
 		var serializedSCTLen uint16
 		err := binary.Read(reader, binary.BigEndian, &serializedSCTLen)
 		if err != nil {
 			return nil, fmt.Errorf("reading SerializedSCT length: %w", err)
 		}
 
+		// Ensure we can't read past the end of this SCT into the next one.
 		reader := io.LimitReader(reader, int64(serializedSCTLen))
 
 		var sct signedCertificateTimestamp
-		err = binary.Read(reader, binary.BigEndian, &sct.Version)
+		err = binary.Read(reader, binary.BigEndian, &sct.sct_version)
 		if err != nil {
 			return nil, fmt.Errorf("reading SCT version: %w", err)
 		}
 
 		// Read the 32 bytes of the LogID.
-		_, err = io.ReadFull(reader, sct.LogID[:])
+		_, err = io.ReadFull(reader, sct.id[:])
 		if err != nil {
 			return nil, fmt.Errorf("reading SCT LogID: %w", err)
 		}
 
-		err = binary.Read(reader, binary.BigEndian, &sct.Timestamp)
+		err = binary.Read(reader, binary.BigEndian, &sct.timestamp)
 		if err != nil {
 			return nil, fmt.Errorf("reading SCT timestamp: %w", err)
 		}
@@ -362,12 +401,14 @@ func parseSCTList(extn cryptobyte.String) ([]signedCertificateTimestamp, error) 
 			return nil, fmt.Errorf("reading SCT timestamp: %w", err)
 		}
 
-		_, err = io.ReadFull(reader, sct.CTExtensions)
+		// We don't process the CT extensions but we copy them through
+		// because they are part of the signed-over data.
+		_, err = io.ReadFull(reader, sct.extensions)
 		if err != nil {
 			return nil, fmt.Errorf("reading CT extensions: %w", err)
 		}
 
-		sct.Signature, err = parseDigitallySigned(reader)
+		sct.signature, err = parseDigitallySigned(reader)
 		if err != nil {
 			return nil, fmt.Errorf("parsing digitally-signed component: %w", err)
 		}
